@@ -1,0 +1,156 @@
+name: 'Fork Sync'
+
+on:
+  schedule:
+    - cron:  '0 3 * * *'
+    # scheduled at 03:00 every day
+
+  workflow_dispatch:  # click the button on Github repo!
+    inputs:
+      sync_test_mode: # Adds a boolean option that appears during manual workflow run for easy test mode config
+        description: 'Fork Sync Test Mode'
+        type: boolean
+        default: false
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    name: Sync latest commits from upstream repo
+    permissions:
+      contents: write
+    outputs:
+      has_new_commits: ${{ steps.sync.outputs.has_new_commits }}
+
+    steps:
+    # REQUIRED step
+    # Step 1: run a standard checkout action, provided by github
+    - name: Checkout target repo
+      uses: actions/checkout@v3
+      with:
+        # optional: set the branch to checkout,
+        # sync action checks out your 'target_sync_branch' anyway
+        ref:  main
+        # REQUIRED if your upstream repo is private (see wiki)
+        persist-credentials: false
+
+    # REQUIRED step
+    # Step 2: run the sync action
+    - name: Sync upstream changes
+      id: sync
+      uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+      with:
+        # REQUIRED 'target_repo_token' exactly like this!
+        target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+        target_sync_branch: main
+        target_branch_push_args: '--force'
+
+        upstream_sync_branch: main
+        upstream_sync_repo: openai/codex
+        upstream_pull_args: '--rebase --tags'
+
+        # Set test_mode true during manual dispatch to run tests instead of the true action!!
+        test_mode: ${{ inputs.sync_test_mode }}
+      
+    # Step 3: Display a sample message based on the sync output var 'has_new_commits'
+    - name: New commits found
+      if: steps.sync.outputs.has_new_commits == 'true'
+      run: echo "New commits were found to sync."
+    
+    - name: No new commits
+      if: steps.sync.outputs.has_new_commits == 'false'
+      run: echo "There were no new commits."
+      
+    - name: Show value of 'has_new_commits'
+      run: echo ${{ steps.sync.outputs.has_new_commits }}
+
+  build:
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    needs: sync_latest_from_upstream
+    if: needs.sync_latest_from_upstream.outputs.has_new_commits == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.92
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/codex-rs/target/
+          key: cargo-${{ matrix.runner }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cargo build
+        shell: bash
+        run: |
+          cargo build --target ${{ matrix.target }} --release --bin codex
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          dest="dist/${{ matrix.target }}"
+          mkdir -p "$dest"
+          cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+          tar -C "$dest" -czf "$dest/codex-${{ matrix.target }}.tar.gz" "codex-${{ matrix.target }}"
+          rm "$dest/codex-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: codex-rs/dist/${{ matrix.target }}/*
+
+  release:
+    name: Release
+    needs:
+      - build
+      - sync_latest_from_upstream
+    if: needs.sync_latest_from_upstream.outputs.has_new_commits == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Define release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_date="$(date -u +%Y-%m-%d)"
+          echo "version=${release_date}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${release_date}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release_meta.outputs.version }}
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: dist/**
